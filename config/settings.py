@@ -4,7 +4,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 AZURE_OPENAI_API_KEY: str = os.getenv("AZURE_OPENAI_API_KEY", "")
-AZURE_OPENAI_ENDPOINT: str = os.getenv("AZURE_OPENAI_ENDPOINT", "https://muriithinewton2023-9408-resource.services.ai.azure.com/openai/v1")
+AZURE_OPENAI_ENDPOINT: str = os.getenv("AZURE_OPENAI_ENDPOINT", "")
 AZURE_OPENAI_DEPLOYMENT: str = "gpt-4.1"
 
 AZURE_SPEECH_KEY: str = os.getenv("AZURE_SPEECH_KEY", "")

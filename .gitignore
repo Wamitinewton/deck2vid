@@ -1,0 +1,52 @@
+# Environment & Secrets
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+.Python
+
+# Virtual environment
+.venv/
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Project output & workspace
+output/
+workspace/
+
+# Audio / Video / Image artifacts
+*.mp4
+*.mp3
+*.wav
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.pdf
+*.pptx
+
+# Logs
+*.log
+logs/
+
+# OS
+.DS_Store
+Thumbs.db

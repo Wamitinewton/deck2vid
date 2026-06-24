@@ -1,0 +1,45 @@
+from __future__ import annotations
+
+import wave
+from pathlib import Path
+from typing import TypedDict
+
+from config import settings
+
+
+class SyncEntry(TypedDict):
+    slide_number: int
+    image_path: str
+    audio_path: str
+    duration: float
+
+
+def _get_audio_duration(audio_path: Path) -> float:
+    with wave.open(str(audio_path), "rb") as wav_file:
+        frames = wav_file.getnframes()
+        rate = wav_file.getframerate()
+        return frames / float(rate)
+
+
+def build_sync_map(
+    image_paths: list[Path],
+    audio_paths: list[Path],
+) -> list[SyncEntry]:
+    if len(image_paths) != len(audio_paths):
+        raise ValueError(
+            f"Slide count mismatch: {len(image_paths)} images vs {len(audio_paths)} audio files"
+        )
+
+    sync_map: list[SyncEntry] = []
+    for index, (image, audio) in enumerate(zip(image_paths, audio_paths), start=1):
+        duration = _get_audio_duration(audio) + settings.TRANSITION_PAUSE_SECONDS
+        sync_map.append(
+            SyncEntry(
+                slide_number=index,
+                image_path=str(image),
+                audio_path=str(audio),
+                duration=round(duration, 3),
+            )
+        )
+
+    return sync_map

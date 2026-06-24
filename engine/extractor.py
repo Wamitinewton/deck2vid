@@ -12,6 +12,18 @@ class SlideContent(TypedDict):
     title: str
     body_text: list[str]
     notes: str
+    # True when the slide contains no extractable text or speaker notes.
+    # These slides are routed to the GPT-4.1 vision narration path.
+    is_visual_only: bool
+
+
+def _is_hidden(slide) -> bool:
+    """Return True if the slide is marked hidden in the PPTX XML (show='0').
+
+    LibreOffice silently excludes hidden slides when exporting to PDF, so we
+    mirror that behaviour here to keep rendered image and audio counts in sync.
+    """
+    return slide._element.get("show") == "0"
 
 
 def _extract_text_from_shape(shape: BaseShape) -> list[str]:
@@ -51,7 +63,12 @@ def extract_slides(pptx_path: str | Path) -> list[SlideContent]:
     prs = Presentation(str(pptx_path))
     slides: list[SlideContent] = []
 
+    # Enumerate with the raw PPTX slide number so slide_number values are
+    # stable and meaningful in logs and output filenames.
     for index, slide in enumerate(prs.slides, start=1):
+        if _is_hidden(slide):
+            continue
+
         title = _extract_title(slide)
         body_text: list[str] = []
 
@@ -68,6 +85,7 @@ def extract_slides(pptx_path: str | Path) -> list[SlideContent]:
                 title=title,
                 body_text=body_text,
                 notes=notes,
+                is_visual_only=not title and not body_text and not notes,
             )
         )
 

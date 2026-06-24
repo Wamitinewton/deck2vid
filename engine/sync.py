@@ -27,7 +27,9 @@ def build_sync_map(
 ) -> list[SyncEntry]:
     if len(image_paths) != len(audio_paths):
         raise ValueError(
-            f"Slide count mismatch: {len(image_paths)} images vs {len(audio_paths)} audio files"
+            f"Slide count mismatch: {len(image_paths)} images vs {len(audio_paths)} audio files.\n"
+            f"Ensure generate_script returned an entry for every slide, including visual-only slides. "
+            f"Try re-running without --skip-render."
         )
 
     sync_map: list[SyncEntry] = []

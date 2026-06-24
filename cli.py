@@ -103,7 +103,7 @@ def generate(
     skip_render: bool,
     script_only: bool,
 ) -> None:
-    """Full pipeline: PPTX → script → audio → video."""
+    """Full pipeline: PPTX → render → script (text + vision) → audio → video."""
     settings.AZURE_SPEECH_VOICE = voice
 
     pptx_path = _resolve_pptx(filename)
@@ -117,8 +117,25 @@ def generate(
         slides = extract_slides(pptx_path)
     click.echo(f"     {len(slides)} slides found")
 
+    # Render must happen before scripting so that visual-only slides have a PNG
+    # available for GPT-4.1 vision narration.
+    slides_dir = output_dir / "slides"
+    if skip_render and slides_dir.exists():
+        image_paths = sorted(slides_dir.glob("slide_*.png"))
+        click.echo(f"  ✓  Using {len(image_paths)} cached slide images  [0.0s]")
+    else:
+        with _step("Rendering slides to PNG  (LibreOffice)"):
+            image_paths = render_slides(pptx_path, output_dir)
+        click.echo(f"     {len(image_paths)} images rendered")
+
+    # Build a slide_number → Path lookup consumed by the vision narration path.
+    # Filenames follow the pattern slide_01.png produced by _rename_images().
+    image_map: dict[int, Path] = {
+        int(p.stem.split("_")[1]): p for p in image_paths
+    }
+
     with _step("Generating narration script  (GPT-4.1)"):
-        script = generate_script(slides, output_dir)
+        script = generate_script(slides, output_dir, image_paths=image_map)
     click.echo(f"     {len(script)} slides scripted → {output_dir / 'script.json'}")
 
     if script_only:
@@ -129,15 +146,6 @@ def generate(
     with _step("Synthesising audio  (Azure TTS)"):
         audio_paths = generate_audio(script, output_dir)
     click.echo(f"     {len(audio_paths)} audio files")
-
-    slides_dir = output_dir / "slides"
-    if skip_render and slides_dir.exists():
-        image_paths = sorted(slides_dir.glob("slide_*.png"))
-        click.echo(f"  ✓  Using {len(image_paths)} cached slide images  [0.0s]")
-    else:
-        with _step("Rendering slides to PNG  (LibreOffice)"):
-            image_paths = render_slides(pptx_path, output_dir)
-        click.echo(f"     {len(image_paths)} images rendered")
 
     with _step("Building sync map"):
         sync_map = build_sync_map(image_paths, audio_paths)

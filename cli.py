@@ -66,7 +66,7 @@ def _step(label: str):
             elapsed = time.perf_counter() - start
             # \r returns to the start of the line without a newline so the
             # counter updates in-place rather than scrolling the terminal.
-            click.echo(f"\r  ⏳ {label}  [{_fmt_duration(elapsed)}]", nl=False)
+            click.echo(f"\r  ... {label}  [{_fmt_duration(elapsed)}]", nl=False)
 
     ticker = threading.Thread(target=_ticker, daemon=True)
     ticker.start()
@@ -78,7 +78,7 @@ def _step(label: str):
         ticker.join()
         elapsed = time.perf_counter() - start
         # Overwrite the spinner line with the final ✓ result.
-        click.echo(f"\r  ✓  {label}  [{_fmt_duration(elapsed)}]")
+        click.echo(f"\r  done  {label}  [{_fmt_duration(elapsed)}]")
 
 
 # ---------------------------------------------------------------------------
@@ -111,7 +111,7 @@ def generate(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     pipeline_start = time.perf_counter()
-    click.echo(f"\n▶ {pptx_path.name}\n")
+    click.echo(f"\n>> {pptx_path.name}\n")
 
     with _step("Extracting slide content"):
         slides = extract_slides(pptx_path)
@@ -123,7 +123,7 @@ def generate(
 
     if script_only:
         total = _fmt_duration(time.perf_counter() - pipeline_start)
-        click.echo(f"\n✅  Script-only complete  [total {total}]\n")
+        click.echo(f"\nScript-only complete  [total {total}]\n")
         return
 
     with _step("Synthesising audio  (Azure TTS)"):
@@ -149,7 +149,7 @@ def generate(
         compose_video(sync_map, video_path, resolution=_parse_resolution(resolution))
 
     total = _fmt_duration(time.perf_counter() - pipeline_start)
-    click.echo(f"\n✅  Done!  {video_path}  [total {total}]\n")
+    click.echo(f"\nDone!  {video_path}  [total {total}]\n")
 
 
 @cli.command(name="list")

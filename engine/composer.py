@@ -41,7 +41,8 @@ def _encode_segment_with_captions(task_data: dict) -> tuple[int, str]:
         "-s", f"{width}x{height}", "-pix_fmt", "rgb24", "-r", str(fps),
         "-i", "-", 
         "-i", task_data['audio_path'],
-        "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "18", # Accelerated preset
+        "-threads", "2", # Prevent thread thrashing across parallel segments
         "-c:a", "aac", "-b:a", "192k", "-pix_fmt", "yuv420p",
         "-shortest", "-t", str(duration), "-avoid_negative_ts", "make_zero",
         "-f", "mpegts", task_data['output_path']
@@ -54,14 +55,28 @@ def _encode_segment_with_captions(task_data: dict) -> tuple[int, str]:
     base_img = _resize_and_pad(base_img, width, height)
     renderer = FrameRenderer(base_img, task_data['word_timestamps'], style, font)
     
-    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
     total_frames = int(duration * fps)
     
+    # 1. Pre-compute phase: Map the timeline to states
+    timeline_states = []
+    for frame_idx in range(total_frames):
+        current_time_ms = (frame_idx / fps) * 1000.0
+        state = renderer.get_state_at(current_time_ms)
+        timeline_states.append(state)
+        
+    # 2. Rendering phase: Draw only the unique states
+    unique_states = set(timeline_states)
+    rendered_cache = {}
+    for state in unique_states:
+        # Cache the raw bytes in memory (Lightning fast lookup)
+        rendered_cache[state] = renderer.render_state(state).tobytes()
+    
+    # 3. Piping phase: Blast the pre-rendered bytes to FFmpeg
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+    
     try:
-        for frame_idx in range(total_frames):
-            current_time_ms = (frame_idx / fps) * 1000.0
-            frame_bytes = renderer.render(current_time_ms).tobytes()
-            proc.stdin.write(frame_bytes)
+        for state in timeline_states:
+            proc.stdin.write(rendered_cache[state])
     except BrokenPipeError:
         pass 
     finally:
@@ -79,7 +94,8 @@ def _encode_segment_static(task_data: dict) -> tuple[int, str]:
         _FFMPEG_CMD, "-y", "-loop", "1",
         "-i", task_data['image_path'], "-i", task_data['audio_path'],
         "-vf", f"scale={task_data['width']}:{task_data['height']}:force_original_aspect_ratio=decrease,pad={task_data['width']}:{task_data['height']}:(ow-iw)/2:(oh-ih)/2:black,format=yuv420p",
-        "-c:v", "libx264", "-tune", "stillimage", "-preset", "fast", "-crf", "18",
+        "-c:v", "libx264", "-tune", "stillimage", "-preset", "veryfast", "-crf", "18",
+        "-threads", "2",
         "-r", str(task_data['fps']), "-c:a", "aac", "-b:a", "192k",
         "-shortest", "-t", str(task_data['duration']), "-avoid_negative_ts", "make_zero",
         "-f", "mpegts", task_data['output_path']

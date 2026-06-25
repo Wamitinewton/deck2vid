@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import TypedDict
 
@@ -134,29 +135,25 @@ def _narrate_visual_slides(
     client: OpenAI,
 ) -> list[SlideScript]:
     """
-    Narrate image-only slides using GPT-4.1 vision.
+    Narrate image-only slides using GPT-4.1 vision in parallel.
 
     Each slide is sent as a separate API call with its rendered PNG base64-encoded
-    in the message payload. Calls are sequential to keep memory usage predictable
-    and avoid hitting the 10-image-per-request API limit for decks with many visuals.
+    in the message payload. ThreadPoolExecutor is used because these are pure
+    network I/O calls — the GIL is released during the HTTP wait, making threads
+    genuinely concurrent. max_workers=8 is safe under standard Azure OpenAI quotas.
     """
     if not slides:
         return []
 
-    scripts: list[SlideScript] = []
-
-    for slide in slides:
+    def _call_vision(slide: SlideContent) -> SlideScript:
         slide_num = slide["slide_number"]
         png_path = image_paths.get(slide_num)
 
         if png_path is None or not png_path.exists():
-            # Fallback narration when the rendered PNG is unavailable (e.g. hidden slide).
             logger.warning("No PNG found for visual-only slide %d — using fallback narration.", slide_num)
-            scripts.append(SlideScript(slide_number=slide_num, narration="Let's take a moment to look at this visual."))
-            continue
+            return SlideScript(slide_number=slide_num, narration="Let's take a moment to look at this visual.")
 
         logger.info("Generating vision narration for slide %d (%s).", slide_num, png_path.name)
-
         b64_image = base64.b64encode(png_path.read_bytes()).decode()
 
         response = client.chat.completions.create(
@@ -166,23 +163,24 @@ def _narrate_visual_slides(
                 {
                     "role": "user",
                     "content": [
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": f"data:image/png;base64,{b64_image}"},
-                        },
-                        {
-                            "type": "text",
-                            "text": "Narrate this slide for the presentation.",
-                        },
+                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64_image}"}},
+                        {"type": "text", "text": "Narrate this slide for the presentation."},
                     ],
                 },
             ],
         )
-
         narration = (response.choices[0].message.content or "").strip()
-        scripts.append(SlideScript(slide_number=slide_num, narration=narration))
+        return SlideScript(slide_number=slide_num, narration=narration)
 
-    return scripts
+    max_workers = min(len(slides), 8)
+    scripts: list[SlideScript] = []
+
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {pool.submit(_call_vision, slide): slide for slide in slides}
+        for future in futures:
+            scripts.append(future.result())
+
+    return sorted(scripts, key=lambda e: e["slide_number"])
 
 
 # ---------------------------------------------------------------------------

@@ -1,12 +1,3 @@
-"""
-Two-phase parallel video composition engine.
-
-Phase 1: Each slide is encoded into an MPEG-TS segment by its own FFmpeg
-         process, all running concurrently via ProcessPoolExecutor.
-Phase 2: Segments are joined losslessly with the FFmpeg concat demuxer
-         (-c copy), completing in seconds regardless of total duration.
-"""
-
 from __future__ import annotations
 
 import logging
@@ -26,7 +17,6 @@ _FFMPEG_CMD = os.environ.get("FFMPEG_BIN", "ffmpeg")
 
 
 class _SegmentTask(NamedTuple):
-    """Picklable descriptor for one per-slide FFmpeg encode job."""
     slide_number: int
     image_path: str
     audio_path: str
@@ -39,14 +29,6 @@ class _SegmentTask(NamedTuple):
 
 
 def _encode_segment(task: _SegmentTask) -> tuple[int, str]:
-    """
-    Encode one slide into an MPEG-TS segment.
-
-    Must be module-level so ProcessPoolExecutor can pickle it.
-    Key flags: -tune stillimage skips motion search (40-70% faster for static
-    content); -avoid_negative_ts make_zero aligns PTS for seamless concat;
-    -shortest stops the infinite -loop 1 stream when audio ends.
-    """
     cmd = [
         task.ffmpeg_cmd,
         "-y",
@@ -82,25 +64,42 @@ def _encode_segment(task: _SegmentTask) -> tuple[int, str]:
     return task.slide_number, task.output_path
 
 
-def _concat_segments(segment_paths: list[str], output_path: str, ffmpeg_cmd: str) -> None:
-    """
-    Join MPEG-TS segments into a single MP4 via the concat demuxer (-c copy).
-    No re-encoding occurs; streams are bitstream-copied directly.
-    -movflags +faststart moves the moov atom to the front for web streaming.
-    """
+
+def _concat_segments(
+    segment_paths: list[str],
+    output_path: str,
+    ffmpeg_cmd: str,
+    ass_path: str | None = None,
+) -> None:
     manifest_path = Path(output_path).parent / "_concat_manifest.txt"
     with manifest_path.open("w", encoding="utf-8") as fh:
         for seg in segment_paths:
-            fh.write(f"file '{seg}'\n")
+            abs_seg = Path(seg).resolve()
+            fh.write(f"file '{abs_seg}'\n")
 
-    cmd = [
-        ffmpeg_cmd, "-y",
-        "-f", "concat", "-safe", "0",
-        "-i", str(manifest_path),
-        "-c", "copy",
-        "-movflags", "+faststart",
-        output_path,
-    ]
+    if ass_path:
+        abs_ass = Path(ass_path).resolve().as_posix()
+        cmd = [
+            ffmpeg_cmd, "-y",
+            "-f", "concat", "-safe", "0",
+            "-i", str(manifest_path),
+            "-vf", f"ass=filename={abs_ass}",
+            "-c:v", "libx264",
+            "-preset", "fast",
+            "-crf", "18",
+            "-c:a", "copy",
+            "-movflags", "+faststart",
+            output_path,
+        ]
+    else:
+        cmd = [
+            ffmpeg_cmd, "-y",
+            "-f", "concat", "-safe", "0",
+            "-i", str(manifest_path),
+            "-c", "copy",
+            "-movflags", "+faststart",
+            output_path,
+        ]
 
     result = subprocess.run(cmd, capture_output=True, text=True)
     manifest_path.unlink(missing_ok=True)
@@ -118,7 +117,6 @@ def _encode_all_segments_parallel(
     height: int,
     max_workers: int,
 ) -> list[str]:
-    """Submit all segment encode jobs to the pool and return paths in slide order."""
     tasks = [
         _SegmentTask(
             slide_number=entry["slide_number"],
@@ -157,14 +155,8 @@ def compose_video(
     sync_map: list[SyncEntry],
     output_path: str | Path,
     resolution: tuple[int, int] = settings.VIDEO_RESOLUTION,
+    ass_path: str | Path | None = None,
 ) -> Path:
-    """
-    Encode all slides in parallel, then concatenate into a final MP4.
-    Worker count is capped at cpu_count() — adding more than one worker per
-    core adds context-switch overhead with no throughput gain.
-    Segments live in a sibling directory so all I/O stays on the same
-    filesystem, avoiding cross-device copy on cleanup.
-    """
     output_path = Path(output_path).resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -188,6 +180,7 @@ def compose_video(
             segment_paths=segment_paths,
             output_path=str(output_path),
             ffmpeg_cmd=_FFMPEG_CMD,
+            ass_path=str(ass_path) if ass_path else None,
         )
     finally:
         shutil.rmtree(segments_dir, ignore_errors=True)

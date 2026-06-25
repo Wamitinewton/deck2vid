@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shutil
 import sys
 import time
 import threading
@@ -9,17 +10,15 @@ from pathlib import Path
 import click
 
 from config import settings
-from engine.composer import compose_video
+from engine.captions import build_ass, build_srt
+from engine.composer import compose_video, _concat_segments, _FFMPEG_CMD
 from engine.extractor import extract_slides
+from engine.pipeline import run_streaming_pipeline
 from engine.renderer import render_slides
 from engine.scripter import generate_script
 from engine.sync import build_sync_map
-from engine.tts import generate_audio
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 
 def _resolve_pptx(filename: str) -> Path:
     path = Path(settings.WORKSPACE_DIR) / filename
@@ -53,19 +52,12 @@ def _fmt_duration(seconds: float) -> str:
 
 @contextmanager
 def _step(label: str):
-    """
-    Context manager that prints a live-updating elapsed timer for a pipeline step.
-    A background thread increments the counter every second on the same line;
-    on exit it overwrites the line with the final elapsed time.
-    """
     start = time.perf_counter()
     stop_event = threading.Event()
 
     def _ticker():
         while not stop_event.wait(timeout=1.0):
             elapsed = time.perf_counter() - start
-            # \r returns to the start of the line without a newline so the
-            # counter updates in-place rather than scrolling the terminal.
             click.echo(f"\r  ... {label}  [{_fmt_duration(elapsed)}]", nl=False)
 
     ticker = threading.Thread(target=_ticker, daemon=True)
@@ -77,13 +69,9 @@ def _step(label: str):
         stop_event.set()
         ticker.join()
         elapsed = time.perf_counter() - start
-        # Overwrite the spinner line with the final ✓ result.
         click.echo(f"\r  done  {label}  [{_fmt_duration(elapsed)}]")
 
 
-# ---------------------------------------------------------------------------
-# Commands
-# ---------------------------------------------------------------------------
 
 @click.group()
 def cli() -> None:
@@ -96,12 +84,14 @@ def cli() -> None:
 @click.option("--resolution", default="1920x1080", show_default=True, help="Output video resolution (WxH)")
 @click.option("--skip-render", is_flag=True, default=False, help="Skip LibreOffice slide render and use cached PNGs")
 @click.option("--script-only", is_flag=True, default=False, help="Generate narration script only — no audio or video")
+@click.option("--captions", is_flag=True, default=False, help="Burn captions permanently into video frames (hard subtitles, visible on every player)")
 def generate(
     filename: str,
     voice: str,
     resolution: str,
     skip_render: bool,
     script_only: bool,
+    captions: bool,
 ) -> None:
     """Full pipeline: PPTX → render → script (text + vision) → audio → video."""
     settings.AZURE_SPEECH_VOICE = voice
@@ -117,8 +107,6 @@ def generate(
         slides = extract_slides(pptx_path)
     click.echo(f"     {len(slides)} slides found")
 
-    # Render must happen before scripting so that visual-only slides have a PNG
-    # available for GPT-4.1 vision narration.
     slides_dir = output_dir / "slides"
     if skip_render and slides_dir.exists():
         image_paths = sorted(slides_dir.glob("slide_*.png"))
@@ -128,8 +116,6 @@ def generate(
             image_paths = render_slides(pptx_path, output_dir)
         click.echo(f"     {len(image_paths)} images rendered")
 
-    # Build a slide_number → Path lookup consumed by the vision narration path.
-    # Filenames follow the pattern slide_01.png produced by _rename_images().
     image_map: dict[int, Path] = {
         int(p.stem.split("_")[1]): p for p in image_paths
     }
@@ -143,18 +129,39 @@ def generate(
         click.echo(f"\nScript-only complete  [total {total}]\n")
         return
 
-    with _step("Synthesising audio  (Azure TTS)"):
-        audio_paths = generate_audio(script, output_dir)
-    click.echo(f"     {len(audio_paths)} audio files")
+    width, height = _parse_resolution(resolution)
+    segments_dir = output_dir / "_segments"
+    segments_dir.mkdir(parents=True, exist_ok=True)
 
-    with _step("Building sync map"):
-        sync_map = build_sync_map(image_paths, audio_paths)
+    with _step("Synthesising audio + encoding segments  (streaming)"):
+        sync_map, segment_paths = run_streaming_pipeline(
+            script=script,
+            image_map=image_map,
+            output_dir=output_dir,
+            segments_dir=segments_dir,
+            width=width,
+            height=height,
+        )
+
     total_duration = sum(e["duration"] for e in sync_map)
-    click.echo(f"     Total video duration: {total_duration:.1f}s")
+    click.echo(f"     {len(sync_map)} slides | total duration: {total_duration:.1f}s")
+
+    ass_path = None
+    if captions:
+        build_srt(sync_map, script, output_dir)
+        ass_path = build_ass(sync_map, script, output_dir)
+        click.echo(f"     Captions written → {ass_path.name} (+ captions.srt)")
 
     video_path = output_dir / "video.mp4"
-    with _step("Composing final video"):
-        compose_video(sync_map, video_path, resolution=_parse_resolution(resolution))
+    with _step("Concatenating segments" + (" + burning in captions" if captions else "")):
+        _concat_segments(
+            segment_paths=segment_paths,
+            output_path=str(video_path),
+            ffmpeg_cmd=_FFMPEG_CMD,
+            ass_path=str(ass_path) if ass_path else None,
+        )
+
+    shutil.rmtree(segments_dir, ignore_errors=True)
 
     total = _fmt_duration(time.perf_counter() - pipeline_start)
     click.echo(f"\nDone!  {video_path}  [total {total}]\n")

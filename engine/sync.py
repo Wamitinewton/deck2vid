@@ -14,11 +14,16 @@ class SyncEntry(TypedDict):
     duration: float
 
 
-def _get_audio_duration(audio_path: Path) -> float:
+def get_audio_duration(audio_path: Path) -> float:
+    """Return the duration of a WAV file in seconds."""
     with wave.open(str(audio_path), "rb") as wav_file:
         frames = wav_file.getnframes()
         rate = wav_file.getframerate()
         return frames / float(rate)
+
+
+# Kept for backward compatibility within the package.
+_get_audio_duration = get_audio_duration
 
 
 def build_sync_map(
@@ -34,7 +39,7 @@ def build_sync_map(
 
     sync_map: list[SyncEntry] = []
     for index, (image, audio) in enumerate(zip(image_paths, audio_paths), start=1):
-        duration = _get_audio_duration(audio) + settings.TRANSITION_PAUSE_SECONDS
+        duration = get_audio_duration(audio) + settings.TRANSITION_PAUSE_SECONDS
         sync_map.append(
             SyncEntry(
                 slide_number=index,

@@ -10,8 +10,9 @@ from pathlib import Path
 import click
 
 from config import settings
-from engine.captions import build_ass, build_srt
-from engine.composer import compose_video, _concat_segments, _FFMPEG_CMD
+from engine.caption_styles import CaptionStyle
+from engine.captions import build_ass, build_karaoke_ass, build_srt
+from engine.composer import _concat_segments, _FFMPEG_CMD
 from engine.extractor import extract_slides
 from engine.pipeline import run_streaming_pipeline
 from engine.renderer import render_slides
@@ -78,6 +79,10 @@ def cli() -> None:
     pass
 
 
+# Valid caption style names for the CLI option.
+_STYLE_CHOICES = [s.value for s in CaptionStyle]
+
+
 @cli.command()
 @click.option("--file", "filename", required=True, help="PPTX filename in workspace/")
 @click.option("--voice", default=settings.AZURE_SPEECH_VOICE, show_default=True, help="Azure TTS voice name")
@@ -85,6 +90,13 @@ def cli() -> None:
 @click.option("--skip-render", is_flag=True, default=False, help="Skip LibreOffice slide render and use cached PNGs")
 @click.option("--script-only", is_flag=True, default=False, help="Generate narration script only — no audio or video")
 @click.option("--captions", is_flag=True, default=False, help="Burn captions permanently into video frames (hard subtitles, visible on every player)")
+@click.option(
+    "--caption-style",
+    type=click.Choice(_STYLE_CHOICES, case_sensitive=False),
+    default=CaptionStyle.TIKTOK.value,
+    show_default=True,
+    help="Caption visual style preset",
+)
 def generate(
     filename: str,
     voice: str,
@@ -92,6 +104,7 @@ def generate(
     skip_render: bool,
     script_only: bool,
     captions: bool,
+    caption_style: str,
 ) -> None:
     """Full pipeline: PPTX → render → script (text + vision) → audio → video."""
     settings.AZURE_SPEECH_VOICE = voice
@@ -146,12 +159,29 @@ def generate(
     total_duration = sum(e["duration"] for e in sync_map)
     click.echo(f"     {len(sync_map)} slides | total duration: {total_duration:.1f}s")
 
+    # ── Captions ──────────────────────────────────────────────────────────
     ass_path = None
-    if captions:
-        build_srt(sync_map, script, output_dir)
-        ass_path = build_ass(sync_map, script, output_dir)
-        click.echo(f"     Captions written → {ass_path.name} (+ captions.srt)")
+    srt_path = None
+    selected_style = CaptionStyle(caption_style)
 
+    if captions:
+        # Always generate SRT for accessibility (soft subtitle track).
+        srt_path = build_srt(sync_map, script, output_dir)
+
+        if selected_style == CaptionStyle.STATIC:
+            # Legacy static captions — one block per slide.
+            ass_path = build_ass(sync_map, script, output_dir)
+            click.echo(f"     Static captions → {ass_path.name} (+ captions.srt)")
+        else:
+            # TikTok-style karaoke captions with word-level sync.
+            ass_path = build_karaoke_ass(
+                sync_map=sync_map,
+                output_dir=output_dir,
+                style=selected_style,
+            )
+            click.echo(f"     Karaoke captions ({selected_style.value}) → {ass_path.name} (+ captions.srt)")
+
+    # ── Final video ───────────────────────────────────────────────────────
     video_path = output_dir / "video.mp4"
     with _step("Concatenating segments" + (" + burning in captions" if captions else "")):
         _concat_segments(
@@ -159,6 +189,7 @@ def generate(
             output_path=str(video_path),
             ffmpeg_cmd=_FFMPEG_CMD,
             ass_path=str(ass_path) if ass_path else None,
+            srt_path=str(srt_path) if srt_path else None,
         )
 
     shutil.rmtree(segments_dir, ignore_errors=True)

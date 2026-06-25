@@ -7,6 +7,7 @@ import re
 import struct
 import time
 import logging
+import threading
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import NamedTuple
@@ -16,6 +17,7 @@ import azure.cognitiveservices.speech as speechsdk
 
 from config import settings
 from engine.scripter import SlideScript
+from engine.sync import WordTimestamp
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +40,12 @@ class _SynthesisTask(NamedTuple):
     speech_key: str
     speech_endpoint: str
     voice_name: str
+
+
+class _ChunkResult(NamedTuple):
+    """Result of synthesising a single text chunk."""
+    audio_data: bytes
+    word_timestamps: list[WordTimestamp]
 
 
 def _build_speech_config(key: str, endpoint: str, voice: str) -> speechsdk.SpeechConfig:
@@ -80,17 +88,38 @@ def _synthesise_chunk(
     text: str,
     config: speechsdk.SpeechConfig,
     chunk_label: str,
-) -> bytes:
+) -> _ChunkResult:
+    """Synthesise a text chunk and capture word-level timing via boundary events.
+
+    Returns a ``_ChunkResult`` containing the raw WAV bytes and a list of
+    ``WordTimestamp`` entries. Offsets are relative to the start of *this*
+    chunk's audio — callers must adjust when concatenating multiple chunks.
+    """
     delay = _RETRY_BASE_DELAY
     last_error: str = ""
 
     for attempt in range(1, _MAX_RETRIES + 1):
+        # Word boundary collection — thread-safe list + lock because the
+        # callback fires on the SDK's internal thread.
+        word_boundaries: list[WordTimestamp] = []
+        lock = threading.Lock()
+
         stream = speechsdk.audio.PullAudioOutputStream()
         audio_config = speechsdk.audio.AudioOutputConfig(stream=stream)
         synthesizer = speechsdk.SpeechSynthesizer(
             speech_config=config,
             audio_config=audio_config,
         )
+
+        def _on_word_boundary(evt: speechsdk.SpeechSynthesisWordBoundaryEventArgs) -> None:
+            with lock:
+                word_boundaries.append(WordTimestamp(
+                    word=evt.text,
+                    offset_ms=evt.audio_offset / 10_000,   # ticks → ms
+                    duration_ms=evt.duration.total_seconds() * 1000,
+                ))
+
+        synthesizer.synthesis_word_boundary.connect(_on_word_boundary)
 
         try:
             sdk_future = synthesizer.speak_text_async(text)
@@ -120,7 +149,10 @@ def _synthesise_chunk(
         del synthesizer
 
         if result.reason == speechsdk.ResultReason.SynthesizingAudioCompleted:
-            return result.audio_data
+            return _ChunkResult(
+                audio_data=result.audio_data,
+                word_timestamps=word_boundaries,
+            )
 
         if result.reason == speechsdk.ResultReason.Canceled:
             details = result.cancellation_details
@@ -150,9 +182,16 @@ def _synthesise_chunk(
     )
 
 
-def _concat_wavs(wav_chunks: list[bytes]) -> bytes:
-    if len(wav_chunks) == 1:
-        return wav_chunks[0]
+def _concat_wavs(chunk_results: list[_ChunkResult]) -> tuple[bytes, list[WordTimestamp]]:
+    """Concatenate WAV chunks and merge word timestamps with cumulative offsets.
+
+    Returns the combined WAV bytes and a unified word-timestamp list where
+    every offset is relative to the start of the concatenated audio.
+    """
+    if len(chunk_results) == 1:
+        return chunk_results[0].audio_data, chunk_results[0].word_timestamps
+
+    wav_chunks = [cr.audio_data for cr in chunk_results]
 
     first = io.BytesIO(wav_chunks[0])
     first.seek(22)
@@ -181,22 +220,59 @@ def _concat_wavs(wav_chunks: list[bytes]) -> bytes:
         b'data',
         pcm_size,
     )
-    return header + pcm_data
+
+    # Merge word timestamps with cumulative offset correction.
+    # Each chunk's timestamps are relative to its own start; we shift them
+    # by the cumulative duration of all preceding chunks.
+    merged_timestamps: list[WordTimestamp] = []
+    cumulative_offset_ms = 0.0
+
+    for cr in chunk_results:
+        wav_bytes = cr.audio_data
+        # Calculate this chunk's duration from its PCM data.
+        chunk_pcm_size = len(wav_bytes) - 44
+        if sample_rate > 0 and block_align > 0:
+            chunk_duration_ms = (chunk_pcm_size / block_align / sample_rate) * 1000
+        else:
+            chunk_duration_ms = 0.0
+
+        for wt in cr.word_timestamps:
+            merged_timestamps.append(WordTimestamp(
+                word=wt["word"],
+                offset_ms=wt["offset_ms"] + cumulative_offset_ms,
+                duration_ms=wt["duration_ms"],
+            ))
+
+        cumulative_offset_ms += chunk_duration_ms
+
+    return header + pcm_data, merged_timestamps
 
 
-def _run_synthesis_task(task: _SynthesisTask) -> tuple[int, str]:
+def _run_synthesis_task(task: _SynthesisTask) -> tuple[int, str, list[WordTimestamp]]:
+    """Synthesise audio for one slide and return word-level timestamps.
+
+    Returns:
+        (slide_number, output_wav_path, word_timestamps)
+    """
     output_path = Path(task.output_path)
 
+    # Skip re-synthesis if the WAV already exists — but we lose word
+    # timestamps in this case (empty list).  This is acceptable for
+    # cache-hit runs where captions have already been written.
     if output_path.exists() and output_path.stat().st_size > 0:
-        return task.slide_number, task.output_path
+        return task.slide_number, task.output_path, []
 
     config = _build_speech_config(task.speech_key, task.speech_endpoint, task.voice_name)
     sentences = _split_into_sentences(task.narration)
 
     if len(sentences) <= 1:
-        wav_chunks = [_synthesise_chunk(sentences[0] if sentences else task.narration, config, f"slide-{task.slide_number:02d}/chunk-1")]
+        chunk_results = [_synthesise_chunk(
+            sentences[0] if sentences else task.narration,
+            config,
+            f"slide-{task.slide_number:02d}/chunk-1",
+        )]
     else:
-        wav_chunks = [None] * len(sentences)
+        chunk_results: list[_ChunkResult | None] = [None] * len(sentences)
         with ThreadPoolExecutor(max_workers=min(len(sentences), 6)) as pool:
             future_to_idx = {
                 pool.submit(
@@ -209,10 +285,12 @@ def _run_synthesis_task(task: _SynthesisTask) -> tuple[int, str]:
             }
             for future in as_completed(future_to_idx):
                 idx = future_to_idx[future]
-                wav_chunks[idx] = future.result()
+                chunk_results[idx] = future.result()
 
-    output_path.write_bytes(_concat_wavs(wav_chunks))
-    return task.slide_number, task.output_path
+    wav_bytes, word_timestamps = _concat_wavs(chunk_results)
+    output_path.write_bytes(wav_bytes)
+
+    return task.slide_number, task.output_path, word_timestamps
 
 
 def generate_audio(
@@ -249,7 +327,7 @@ def generate_audio(
         for future in as_completed(future_to_slide):
             slide_num = future_to_slide[future]
             try:
-                num, path_str = future.result()
+                num, path_str, _word_ts = future.result()
                 results[num] = Path(path_str)
                 logger.info("Audio ready: slide %02d", num)
             except Exception as exc:

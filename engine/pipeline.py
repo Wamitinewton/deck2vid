@@ -9,7 +9,7 @@ from pathlib import Path
 from config import settings
 from engine.composer import _FFMPEG_CMD, _SegmentTask, _encode_segment
 from engine.scripter import SlideScript
-from engine.sync import SyncEntry, get_audio_duration
+from engine.sync import SyncEntry, WordTimestamp, get_audio_duration
 from engine.tts import (
     _SynthesisTask,
     _TTS_MAX_WORKERS,
@@ -69,6 +69,9 @@ def run_streaming_pipeline(
     The TTS process pool and FFmpeg thread pool run simultaneously. As each
     slide's WAV completes, its encode job is submitted immediately — no phase
     barrier between synthesis and encoding.
+
+    Word-level timestamps from the TTS boundary events are threaded into each
+    SyncEntry for downstream karaoke caption generation.
     """
     audio_dir = output_dir / "audio"
     audio_dir.mkdir(parents=True, exist_ok=True)
@@ -95,7 +98,7 @@ def run_streaming_pipeline(
         ) as tts_pool,
         ThreadPoolExecutor(max_workers=_ENCODE_THREAD_WORKERS) as encode_pool,
     ):
-        tts_future_map: dict[Future[tuple[int, str]], _SynthesisTask] = {
+        tts_future_map: dict[Future[tuple[int, str, list[WordTimestamp]]], _SynthesisTask] = {
             tts_pool.submit(_run_synthesis_task, task): task
             for task in tts_tasks
         }
@@ -103,7 +106,7 @@ def run_streaming_pipeline(
         for tts_future in as_completed(tts_future_map):
             task = tts_future_map[tts_future]
             try:
-                slide_num, audio_path_str = tts_future.result()
+                slide_num, audio_path_str, word_timestamps = tts_future.result()
             except Exception as exc:
                 for f in tts_future_map:
                     f.cancel()
@@ -122,6 +125,7 @@ def run_streaming_pipeline(
                 image_path=str(image_path),
                 audio_path=audio_path_str,
                 duration=duration,
+                word_timestamps=word_timestamps,
             )
 
             encode_task = _make_encode_task(
